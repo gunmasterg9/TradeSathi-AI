@@ -1,0 +1,11 @@
+PACKING LIST
+Exporter: Kamakshi Seafood Exports
+Buyer: Ocean Foods LLC
+Invoice No: INV-2026-104
+Product: Frozen Indian Mackerel, IQF
+Quantity: 1000 cartons
+Net Weight: 18100 kg
+Gross Weight: 19500 kg
+Packages: 1000
+
+Sample data for demo only. Not a real commercial document. This file intentionally has a net-weight discrepancy.
