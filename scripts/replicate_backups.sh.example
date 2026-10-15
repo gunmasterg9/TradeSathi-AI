@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# TradeSathi AI — Off-Host Backup Replication Script (Template)
+# File: scripts/replicate_backups.sh.example
+# ==============================================================================
+# Usage & Security Guidelines:
+#   1. Copy to /usr/local/bin/tradesathi-replicate-backups.sh
+#   2. chmod 700 /usr/local/bin/tradesathi-replicate-backups.sh
+#   3. Populate REMOTE_DESTINATION with approved S3 bucket or remote rsync endpoint
+#   4. Schedule via cron or systemd timer (e.g. daily at 03:00 UTC)
+#
+# Least-Privilege IAM Policy for AWS S3 Replication:
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Sid": "AllowBackupReplication",
+#       "Effect": "Allow",
+#       "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
+#       "Resource": [
+#         "arn:aws:s3:::tradesathi-production-backups-encrypted",
+#         "arn:aws:s3:::tradesathi-production-backups-encrypted/*"
+#       ]
+#     },
+#     {
+#       "Sid": "AllowKmsEncryption",
+#       "Effect": "Allow",
+#       "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+#       "Resource": "arn:aws:kms:region:account:key/YOUR-KMS-KEY-ID"
+#     }
+#   ]
+# }
+#
+# Disaster Recovery Remote Restoration:
+#   1. Download remote backup snapshot to isolated temporary directory:
+#      aws s3 sync s3://tradesathi-production-backups-encrypted/backups/<BACKUP_ID>/ /tmp/dr-restore/<BACKUP_ID>/
+#   2. Verify downloaded integrity against manifest.json:
+#      python3 -m backend.app.backup verify /tmp/dr-restore/<BACKUP_ID>
+#   3. Restore to isolated test database and documents directory:
+#      python3 -m backend.app.backup restore /tmp/dr-restore/<BACKUP_ID> \
+#          --target-db /tmp/dr-restore/test.db \
+#          --target-storage /tmp/dr-restore/documents
+#   4. Validate SQLite integrity and foreign keys:
+#      sqlite3 /tmp/dr-restore/test.db "PRAGMA integrity_check; PRAGMA foreign_key_check;"
+# ==============================================================================
+
+set -euo pipefail
+
+BACKUP_LOCAL_DIR="/var/www/tradesathi/backend/backups"
+LOG_FILE="/var/log/tradesathi/backup-replication.log"
+REMOTE_DESTINATION="s3://tradesathi-production-backups-encrypted/backups/"
+ALERT_WEBHOOK_URL="" # Optional monitoring alert webhook (e.g. Slack/PagerDuty)
+MAX_RETRIES=3
+RETRY_DELAY=5
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" | tee -a "$LOG_FILE"
+}
+
+on_failure() {
+    local exit_code=$?
+    local failed_line=$1
+    log "CRITICAL ERROR: Replication failed at line $failed_line with exit code $exit_code."
+    if [ -n "$ALERT_WEBHOOK_URL" ] && command -v curl >/dev/null 2>&1; then
+        curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"🚨 TradeSathi AI Off-Host Backup Replication Failed on $(hostname) at line $failed_line (exit $exit_code)\"}" \
+            "$ALERT_WEBHOOK_URL" || true
+    fi
+    exit "$exit_code"
+}
+
+trap 'on_failure $LINENO' ERR
+
+log "Starting TradeSathi off-host backup replication..."
+
+# 1. Verify local backup directory exists
+if [ ! -d "$BACKUP_LOCAL_DIR" ]; then
+    log "ERROR: Local backup directory $BACKUP_LOCAL_DIR does not exist."
+    exit 1
+fi
+
+# 2. Locate latest completed backup snapshot
+LATEST_BACKUP=$(find "$BACKUP_LOCAL_DIR" -maxdepth 1 -mindepth 1 -type d -name "backup_*" | sort | tail -n 1)
+
+if [ -z "$LATEST_BACKUP" ]; then
+    log "ERROR: No backup folders found in $BACKUP_LOCAL_DIR."
+    exit 1
+fi
+
+BACKUP_ID=$(basename "$LATEST_BACKUP")
+log "Latest local backup identified: $BACKUP_ID ($LATEST_BACKUP)"
+
+# 3. Verify integrity of latest backup before replication
+if [ -f "$LATEST_BACKUP/manifest.json" ]; then
+    log "Verifying manifest.json integrity for $LATEST_BACKUP prior to upload..."
+    python3 -m backend.app.backup verify "$LATEST_BACKUP" >> "$LOG_FILE" 2>&1
+    log "Pre-upload integrity verified successfully."
+else
+    log "ERROR: manifest.json missing in $LATEST_BACKUP. Aborting replication."
+    exit 1
+fi
+
+# 4. Synchronize to off-host encrypted destination with retry logic and atomic manifest marker
+# Sequence:
+#   Phase A: Upload data payloads (database and documents) EXCLUDING manifest.json
+#   Phase B: Upload manifest.json as the atomic completion marker
+# This guarantees interrupted or partial transfers cannot be recognized as valid snapshots remotely.
+
+REMOTE_BACKUP_TARGET="${REMOTE_DESTINATION%/}/${BACKUP_ID}/"
+
+sync_with_retry() {
+    local attempt=1
+    while [ $attempt -le $MAX_RETRIES ]; do
+        log "Replication attempt $attempt of $MAX_RETRIES to $REMOTE_BACKUP_TARGET..."
+        
+        if command -v aws >/dev/null 2>&1; then
+            # Phase A: Sync database and documents (excluding manifest)
+            log "Uploading payload data (excluding manifest)..."
+            aws s3 sync "$LATEST_BACKUP/" "$REMOTE_BACKUP_TARGET" \
+                --exclude "manifest.json" \
+                --exclude "*.tmp" \
+                --sse aws:kms \
+                --only-show-errors >> "$LOG_FILE" 2>&1
+
+            # Phase B: Upload manifest.json as atomic completion marker
+            log "Uploading manifest.json completion marker..."
+            aws s3 cp "$LATEST_BACKUP/manifest.json" "${REMOTE_BACKUP_TARGET}manifest.json" \
+                --sse aws:kms \
+                --only-show-errors >> "$LOG_FILE" 2>&1
+
+            # Phase C: Write replication receipt
+            echo "{\"replicated_at\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",\"backup_id\":\"$BACKUP_ID\",\"host\":\"$(hostname)\"}" | \
+                aws s3 cp - "${REMOTE_BACKUP_TARGET}.replication_complete" \
+                --sse aws:kms \
+                --only-show-errors >> "$LOG_FILE" 2>&1
+
+            log "AWS S3 replication verified and complete."
+            return 0
+        elif command -v rsync >/dev/null 2>&1; then
+            log "AWS CLI not found. Utilizing rsync transfer..."
+            rsync -avz --exclude "manifest.json" "$LATEST_BACKUP/" "backup-user@backup-host:/var/remote-backups/tradesathi/${BACKUP_ID}/" >> "$LOG_FILE" 2>&1
+            rsync -avz "$LATEST_BACKUP/manifest.json" "backup-user@backup-host:/var/remote-backups/tradesathi/${BACKUP_ID}/manifest.json" >> "$LOG_FILE" 2>&1
+            log "Rsync replication complete."
+            return 0
+        else
+            log "ERROR: Neither aws-cli nor rsync available for off-host transfer."
+            return 1
+        fi
+
+        log "WARNING: Attempt $attempt failed. Retrying in ${RETRY_DELAY}s..."
+        sleep "$RETRY_DELAY"
+        attempt=$((attempt + 1))
+        RETRY_DELAY=$((RETRY_DELAY * 2))
+    done
+
+    log "ERROR: All $MAX_RETRIES replication attempts failed."
+    return 1
+}
+
+sync_with_retry
+
+log "Off-host backup replication finished successfully for $BACKUP_ID."

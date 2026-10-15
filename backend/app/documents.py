@@ -46,8 +46,12 @@ def detect_document_type(filename: str, text: str = "") -> str:
     return "unknown"
 
 
-def extract_text(filename: str, content: bytes) -> str:
-    """Extract readable text from supported, text-based document formats."""
+def extract_text_with_metadata(
+    filename: str, content: bytes
+) -> tuple[str, list[dict], str]:
+    """Extract readable text with page-level bounds and format classification.
+    Returns (extracted_text, pages_metadata, extraction_method).
+    """
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise ValueError(
@@ -57,7 +61,8 @@ def extract_text(filename: str, content: bytes) -> str:
         raise ValueError(f"{filename} is empty.")
 
     if suffix == ".txt":
-        return content.decode("utf-8-sig", errors="replace").strip()
+        text = content.decode("utf-8-sig", errors="replace").strip()
+        return text, [], "plain_text"
 
     if suffix == ".eml":
         message = BytesParser(policy=policy.default).parsebytes(content)
@@ -71,18 +76,34 @@ def extract_text(filename: str, content: bytes) -> str:
             parts.append(body.get_content())
         elif message.get_content_type() == "text/plain":
             parts.append(str(message.get_content()))
-        return "\n".join(part for part in parts if part).strip()
+        text = "\n".join(part for part in parts if part).strip()
+        return text, [], "email_parsed"
 
     if suffix == ".pdf":
         reader = PdfReader(BytesIO(content))
         if len(reader.pages) == 0:
             raise ValueError(f"PDF document {filename} contains no pages.")
-        extracted = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-        if not extracted:
+        pages_meta: list[dict] = []
+        page_texts: list[str] = []
+        current_offset = 0
+        for idx, page in enumerate(reader.pages):
+            p_text = (page.extract_text() or "").strip()
+            start_off = current_offset
+            end_off = start_off + len(p_text)
+            pages_meta.append({
+                "page_number": idx + 1,
+                "char_start": start_off,
+                "char_end": end_off,
+                "text": p_text,
+            })
+            page_texts.append(p_text)
+            current_offset = end_off + 1
+        full_text = "\n".join(page_texts).strip()
+        if not full_text:
             raise ValueError(
                 f"No selectable text found in {filename}. Scanned PDFs require OCR, which is not supported in this MVP."
             )
-        return extracted
+        return full_text, pages_meta, "pdf_embedded_text"
 
     if suffix == ".docx":
         doc = DocxDocument(BytesIO(content))
@@ -92,9 +113,16 @@ def extract_text(filename: str, content: bytes) -> str:
                 cells_text = [cell.text.strip() for cell in row.cells]
                 if any(cells_text):
                     paragraphs.append(" | ".join(cells_text))
-        return "\n".join(paragraphs).strip()
+        text = "\n".join(paragraphs).strip()
+        return text, [], "docx_document"
 
     raise ValueError("Unsupported file type.")
+
+
+def extract_text(filename: str, content: bytes) -> str:
+    """Extract readable text from supported, text-based document formats."""
+    text, _, _ = extract_text_with_metadata(filename, content)
+    return text
 
 
 async def read_upload_with_bytes(upload: UploadFile, max_bytes: int) -> tuple[str, str, str, bytes]:

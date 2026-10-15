@@ -1,0 +1,207 @@
+{
+  "timestamp": "2026-10-13T14:44:51.751136+00:00",
+  "project_version": "0.2.0",
+  "backup_id": "backup_20261013_131946_d599fd",
+  "backup_path": "C:\\Users\\RAHUL\\Desktop\\gautam\\tradesathi-ai\\backend\\backups\\backup_20261013_131946_d599fd",
+  "restored_db_path": "C:\\Users\\RAHUL\\AppData\\Local\\Temp\\tradesathi-restore-test-20261013-190724\\tradesathi-test.db",
+  "restored_storage_dir": "C:\\Users\\RAHUL\\AppData\\Local\\Temp\\tradesathi-restore-test-20261013-190724\\documents",
+  "recovery_url": "http://127.0.0.1:8001",
+  "path_safety_passed": true,
+  "overall_status": "PASS",
+  "checks": [
+    {
+      "id": "CHK-A-BACKUP-INTEGRITY",
+      "name": "Backup Integrity & Manifest Hashing",
+      "category": "Backup Integrity",
+      "status": "PASS",
+      "expected": {
+        "verified": true,
+        "db_integrity": "ok",
+        "min_docs": 1
+      },
+      "actual": {
+        "verified": true,
+        "backup_id": "backup_20261013_131946_d599fd",
+        "documents_verified": 78,
+        "database_sha256": "95a64c9214b5..."
+      },
+      "detail": "Verified backup backup_20261013_131946_d599fd with 78 documents and SQLite integrity check ok.",
+      "duration_ms": 60.64
+    },
+    {
+      "id": "CHK-B-ISOLATED-RESTORE",
+      "name": "Isolated Restoration Safety & Boundary Verification",
+      "category": "Restoration Safety",
+      "status": "PASS",
+      "expected": "Restored paths exist and are strictly isolated from live paths",
+      "actual": {
+        "database_exists": true,
+        "database_size_bytes": 3850240,
+        "storage_dir_exists": true
+      },
+      "detail": "Restored artifacts exist at isolated locations: DB=tradesathi-test.db (3850240 bytes), Storage=documents.",
+      "duration_ms": 0.48
+    },
+    {
+      "id": "CHK-C1-SQLITE-PRAGMA",
+      "name": "SQLite PRAGMA Integrity & Foreign Keys",
+      "category": "SQLite Integrity",
+      "status": "PASS",
+      "expected": {
+        "integrity_check": "ok",
+        "foreign_key_violations": 0
+      },
+      "actual": {
+        "integrity_check": "ok",
+        "foreign_key_violations": 0
+      },
+      "detail": "Database passed PRAGMA integrity_check and PRAGMA foreign_key_check cleanly.",
+      "duration_ms": 14.13
+    },
+    {
+      "id": "CHK-C2-TABLE-ROW-COUNTS",
+      "name": "Core Table Row Counts (Snapshot Baseline)",
+      "category": "SQLite Integrity",
+      "status": "PASS",
+      "expected": {
+        "shipments": 25,
+        "documents": 28,
+        "analyses": 230,
+        "finding_reviews": 2
+      },
+      "actual": {
+        "shipments": 25,
+        "documents": 28,
+        "analyses": 230,
+        "finding_reviews": 2
+      },
+      "detail": "All snapshot table counts matched: shipments=25, documents=28, analyses=230, finding_reviews=2.",
+      "duration_ms": 1.17
+    },
+    {
+      "id": "CHK-D-RESTORED-DOCS-INTEGRITY",
+      "name": "Restored Document Files & Register Correspondence",
+      "category": "Document Integrity",
+      "status": "PASS",
+      "expected": {
+        "manifest_documents": 78,
+        "db_document_records": 28,
+        "missing_files": 0,
+        "hash_mismatches": 0
+      },
+      "actual": {
+        "manifest_documents_verified": 78,
+        "db_document_records": 28,
+        "missing_files": 0,
+        "hash_mismatches": 0
+      },
+      "detail": "All 78 physical manifest files verified on disk with matching SHA-256 hashes. Database document records: 28. Physical file count (78) represents all stored export documents across 49 shipment workspaces in the snapshot. Database document records (28) represents currently active document register entries in the 'documents' table across 25 active shipments. The two counts measure physical file presence versus active relational document registrations.",
+      "duration_ms": 29.9
+    },
+    {
+      "id": "CHK-E-HEALTH-API",
+      "name": "Application Health Endpoint (/api/health)",
+      "category": "API Verification",
+      "status": "PASS",
+      "expected": {
+        "http_status": 200,
+        "database": "connected",
+        "storage": "writable"
+      },
+      "actual": {
+        "status": "ok",
+        "database": "connected",
+        "storage": "writable",
+        "ollama": "connected",
+        "models": [
+          "llama3.2:latest",
+          "qwen2.5:7b"
+        ]
+      },
+      "detail": "Application health verified (DB: connected, Storage: writable, Ollama: connected, Models: 2).",
+      "duration_ms": 933.89
+    },
+    {
+      "id": "CHK-F-SHIPMENTS-API",
+      "name": "Shipment API Read Verification (/api/shipments)",
+      "category": "API Verification",
+      "status": "PASS",
+      "expected": {
+        "http_status": 200,
+        "total": 25
+      },
+      "actual": {
+        "http_status": 200,
+        "total": 25
+      },
+      "detail": "Successfully retrieved shipment list with exact snapshot count of 25 shipments.",
+      "duration_ms": 366.29
+    },
+    {
+      "id": "CHK-G-DOC-DOWNLOAD-HASH",
+      "name": "Document Metadata & Safe Download Verification",
+      "category": "Document Verification",
+      "status": "PASS",
+      "expected": {
+        "document_id": "doc-7fe18a181c",
+        "filename": "commercial_invoice.txt",
+        "file_size": 188,
+        "sha256": "cfdb696d898ae957ca663b0b43c04673828bb87e16dd00088082b793f260bb34"
+      },
+      "actual": {
+        "download_status": 200,
+        "downloaded_bytes": 188,
+        "sha256": "cfdb696d898ae957ca663b0b43c04673828bb87e16dd00088082b793f260bb34"
+      },
+      "detail": "Document doc-7fe18a181c (commercial_invoice.txt) downloaded successfully. Exact byte size (188) and SHA-256 matched.",
+      "duration_ms": 371.72
+    },
+    {
+      "id": "CHK-H1-ANALYSES-LIST-API",
+      "name": "Analyses Audit History Endpoint (/api/analyses)",
+      "category": "Audit Trail Verification",
+      "status": "PASS",
+      "expected": {
+        "total": 230
+      },
+      "actual": {
+        "total": 230,
+        "page": 1,
+        "total_pages": 12
+      },
+      "detail": "Retrieved historical analyses catalog via API: total=230 across 12 pages.",
+      "duration_ms": 343.12
+    },
+    {
+      "id": "CHK-H2-REVIEW-EVENTS-API",
+      "name": "Analysis Review Events History (/api/analyses/{id}/reviews)",
+      "category": "Audit Trail Verification",
+      "status": "PASS",
+      "expected": {
+        "analysis_id": "anl-33c06e943f",
+        "reviews_count": 2
+      },
+      "actual": {
+        "analysis_id": "anl-33c06e943f",
+        "reviews_count": 2
+      },
+      "detail": "Retrieved append-only review events for anl-33c06e943f: count=2 matching database records.",
+      "duration_ms": 324.85
+    }
+  ],
+  "summary_counts": {
+    "PASS": 10,
+    "FAIL": 0,
+    "BLOCKED": 0,
+    "NOT RUN": 0,
+    "WARN": 0
+  },
+  "regression_results": null,
+  "redacted_config": {
+    "recovery_url": "http://127.0.0.1:8001",
+    "path_safety": "verified_safe"
+  },
+  "recommended_actions": [
+    "Disaster recovery verified. Restored database and document storage match expected snapshot integrity."
+  ]
+}

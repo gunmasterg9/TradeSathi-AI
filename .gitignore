@@ -23,4 +23,16 @@ frontend/.env
 # Local Document Storage
 backend/storage/
 
+# Backup snapshots
+backend/backups/
+
+# Staging Environment Isolation
+staging_data/
+
+# Temporary Scratch Directories
+scratch/
+backend/scratch/
+reports/recovery/.tmp_dl/
+
+
 

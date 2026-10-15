@@ -135,7 +135,7 @@ def calculate_shipment_readiness(
         last_reconciliation_timestamp = latest_analysis.get("created_at")
         last_reconciliation_status = latest_analysis.get("status")
 
-        # Extract discrepancies if response_data available
+        # Extract discrepancies if response_data available, or directly on latest_analysis
         response_json = latest_analysis.get("response_data") or latest_analysis.get("response_json")
         discrepancies: list[dict[str, Any]] = []
         if isinstance(response_json, dict):
@@ -147,12 +147,14 @@ def calculate_shipment_readiness(
                 discrepancies = parsed.get("discrepancies", [])
             except Exception:
                 discrepancies = []
+        elif "discrepancies" in latest_analysis:
+            discrepancies = latest_analysis.get("discrepancies", [])
 
         unresolved_critical_discrepancies = sum(
-            1 for d in discrepancies if d.get("severity") == "critical"
+            1 for d in discrepancies if d.get("severity") == "critical" and d.get("review_status") != "resolved"
         )
         unresolved_warning_discrepancies = sum(
-            1 for d in discrepancies if d.get("severity") == "warning"
+            1 for d in discrepancies if d.get("severity") == "warning" and d.get("review_status") != "resolved"
         )
 
     # Explainable rules evaluation

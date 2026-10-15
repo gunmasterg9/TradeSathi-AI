@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Any
 
@@ -95,52 +96,326 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-def normalize_weight_to_kg(raw_text: str | None) -> tuple[float | None, str | None]:
-    """Parse a weight string and convert to kilograms if necessary.
-    Handles 'kg', 'kgs', 'lbs', 'lb', 'pounds', 'mt', 'metric tons', 'g', 'grams'.
+MONTH_NAMES = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+PLACEHOLDER_STRINGS = {
+    "n/a", "na", "none", "null", "nil", "-", "--", "---", "tbd", "unknown", "pending"
+}
+
+COMMON_ISO_CURRENCIES = {
+    "USD", "EUR", "GBP", "INR", "SGD", "AED", "JPY",
+    "CAD", "AUD", "CHF", "CNY", "NZD", "HKD", "BRL", "ZAR", "QAR", "SAR", "THB", "MYR", "IDR"
+}
+
+
+def clean_entity_value(value: str | None) -> str | None:
+    """Strip noise and placeholders; return None if value is empty or non-informative placeholder."""
+    if not value:
+        return None
+    val = value.strip()
+    if not val or val.lower() in PLACEHOLDER_STRINGS:
+        return None
+    val = re.sub(r"^[\"'\-\s:]+|[\"'\-\s:;]+$", "", val).strip()
+    return val if val.lower() not in PLACEHOLDER_STRINGS else None
+
+
+def parse_and_validate_date(raw_text: str | None) -> tuple[str | None, str | None, str, str | None]:
+    """Parse and validate date strings into ISO format (YYYY-MM-DD).
+    Returns (iso_date_or_none, raw_text, validation_status, note).
     """
     if not raw_text:
-        return None, None
+        return None, None, "missing", None
+
+    cleaned = raw_text.strip()
+    if not cleaned or cleaned.lower() in PLACEHOLDER_STRINGS:
+        return None, None, "missing", None
+
+    # Check 1: YYYY-MM-DD or YYYY/MM/DD
+    m_iso = re.match(r"^([0-9]{4})[-/.]([0-9]{1,2})[-/.]([0-9]{1,2})$", cleaned)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        try:
+            dt = datetime(y, m, d, tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%d"), cleaned, "verified", "Valid ISO calendar date"
+        except (ValueError, OverflowError):
+            return None, cleaned, "invalid", f"Invalid calendar date '{cleaned}'"
+
+    # Check 2: DD-MM-YYYY or DD/MM/YYYY or DD.MM.YYYY
+    m_dmy = re.match(r"^([0-9]{1,2})[-/.]([0-9]{1,2})[-/.]([0-9]{4})$", cleaned)
+    if m_dmy:
+        p1, p2, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+        if p1 > 12 and 1 <= p2 <= 12:
+            d, m = p1, p2
+        elif p2 > 12 and 1 <= p1 <= 12:
+            m, d = p1, p2
+        else:
+            d, m = p1, p2
+        try:
+            dt = datetime(y, m, d, tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%d"), cleaned, "verified", "Valid calendar date (DD/MM/YYYY)"
+        except (ValueError, OverflowError):
+            return None, cleaned, "invalid", f"Invalid calendar date '{cleaned}'"
+
+    # Check 3: Textual month (e.g. "12 October 2026", "12-Oct-2026", "Oct 12, 2026")
+    m_txt1 = re.match(r"^([0-9]{1,2})[\s\-_]+([A-Za-z]{3,9})[\s\-_,]+([0-9]{4})$", cleaned)
+    if m_txt1:
+        d = int(m_txt1.group(1))
+        m_str = m_txt1.group(2).lower()
+        y = int(m_txt1.group(3))
+        m = MONTH_NAMES.get(m_str) or MONTH_NAMES.get(m_str[:3])
+        if m:
+            try:
+                dt = datetime(y, m, d, tzinfo=timezone.utc)
+                return dt.strftime("%Y-%m-%d"), cleaned, "verified", "Valid calendar date"
+            except (ValueError, OverflowError):
+                return None, cleaned, "invalid", f"Invalid calendar date '{cleaned}'"
+
+    m_txt2 = re.match(r"^([A-Za-z]{3,9})[\s\-_]+([0-9]{1,2})[\s\-_,]+([0-9]{4})$", cleaned)
+    if m_txt2:
+        m_str = m_txt2.group(1).lower()
+        d = int(m_txt2.group(2))
+        y = int(m_txt2.group(3))
+        m = MONTH_NAMES.get(m_str) or MONTH_NAMES.get(m_str[:3])
+        if m:
+            try:
+                dt = datetime(y, m, d, tzinfo=timezone.utc)
+                return dt.strftime("%Y-%m-%d"), cleaned, "verified", "Valid calendar date"
+            except (ValueError, OverflowError):
+                return None, cleaned, "invalid", f"Invalid calendar date '{cleaned}'"
+
+    return None, cleaned, "invalid", f"Unrecognized or invalid date format: '{cleaned}'"
+
+
+def normalize_weight_with_provenance(raw_text: str | None) -> tuple[float | None, str | None, str, str | None]:
+    """Parse a weight string and convert unambiguously to kilograms.
+    Returns (normalized_kg, formatted_raw, validation_status, note).
+    """
+    if not raw_text:
+        return None, None, "missing", None
 
     cleaned = raw_text.replace(",", "").strip()
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)?", cleaned)
+    if not cleaned or cleaned.lower() in PLACEHOLDER_STRINGS:
+        return None, None, "missing", None
+
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z\s]+)?", cleaned)
     if not match:
-        return None, None
+        return None, cleaned, "invalid", f"Could not parse numeric weight from '{cleaned}'"
 
     try:
         val = float(match.group(1))
     except ValueError:
-        return None, None
+        return None, cleaned, "invalid", f"Invalid numeric weight in '{cleaned}'"
 
-    unit = (match.group(2) or "kg").lower()
-    if unit in ("lb", "lbs", "pound", "pounds"):
-        # 1 lb = 0.45359237 kg
-        return round(val * 0.45359237, 2), f"{val} lbs"
-    if unit in ("mt", "ton", "tons", "metric ton", "metric tons"):
-        # 1 MT = 1000 kg
-        return round(val * 1000.0, 2), f"{val} MT"
-    if unit in ("g", "gram", "grams"):
-        return round(val / 1000.0, 4), f"{val} g"
-    return val, f"{val} kg"
+    raw_unit = (match.group(2) or "").strip().lower()
+
+    if not raw_unit:
+        # Ambiguous unit - value is present but unit was omitted in source text
+        return val, f"{val}", "uncertain", "Weight unit unspecified in source text; recorded with uncertainty"
+
+    if raw_unit in ("kg", "kgs", "kilo", "kilos", "kilogram", "kilograms"):
+        return val, f"{val} kg", "verified", None
+    elif raw_unit in ("lb", "lbs", "pound", "pounds"):
+        norm_kg = round(val * 0.45359237, 2)
+        return norm_kg, f"{val} lbs", "verified", f"Pounds converted to kilograms ({val} lbs = {norm_kg} kg)"
+    elif raw_unit in ("mt", "ton", "tons", "metric ton", "metric tons", "t"):
+        norm_kg = round(val * 1000.0, 2)
+        return norm_kg, f"{val} MT", "verified", f"Metric tons converted to kilograms ({val} MT = {norm_kg} kg)"
+    elif raw_unit in ("g", "gram", "grams"):
+        norm_kg = round(val / 1000.0, 4)
+        return norm_kg, f"{val} g", "verified", f"Grams converted to kilograms ({val} g = {norm_kg} kg)"
+    elif raw_unit in ("oz", "ounce", "ounces"):
+        norm_kg = round(val * 0.02834952, 3)
+        return norm_kg, f"{val} oz", "verified", f"Ounces converted to kilograms ({val} oz = {norm_kg} kg)"
+    else:
+        # Unknown/invalid unit
+        return None, cleaned, "invalid", f"Unrecognized weight unit '{raw_unit}'"
+
+
+def normalize_weight_to_kg(raw_text: str | None) -> tuple[float | None, str | None]:
+    """Backward-compatible helper returning (normalized_kg, formatted_raw)."""
+    norm, raw, _, _ = normalize_weight_with_provenance(raw_text)
+    return norm, raw
+
+
+def parse_and_validate_currency(raw_currency: str | None, text_context: str = "") -> tuple[str | None, str | None, str, str | None]:
+    """Parse and validate ISO 4217 currency.
+    Returns (normalized_currency, raw_currency, validation_status, note).
+    """
+    if raw_currency:
+        cleaned = raw_currency.strip().upper()
+        if cleaned in COMMON_ISO_CURRENCIES:
+            return cleaned, raw_currency.strip(), "verified", f"Valid ISO currency code {cleaned}"
+        if cleaned == "€":
+            return "EUR", raw_currency.strip(), "verified", "Euro (€) symbol mapped to EUR"
+        if cleaned == "£":
+            return "GBP", raw_currency.strip(), "verified", "Pound (£) symbol mapped to GBP"
+        if cleaned == "₹":
+            return "INR", raw_currency.strip(), "verified", "Rupee (₹) symbol mapped to INR"
+        if cleaned == "¥":
+            return "JPY", raw_currency.strip(), "verified", "Yen (¥) symbol mapped to JPY"
+        if cleaned == "$":
+            return "USD", raw_currency.strip(), "verified", "Dollar ($) symbol mapped to USD"
+        if len(cleaned) == 3 and cleaned.isalpha():
+            return cleaned, raw_currency.strip(), "verified", f"Standard currency code {cleaned}"
+        return None, raw_currency.strip(), "invalid", f"Unrecognized currency code or symbol '{raw_currency}'"
+
+    if text_context:
+        curr_match = re.search(r"\b(USD|EUR|GBP|INR|SGD|AED|JPY|CAD|AUD|CHF|CNY)\b", text_context)
+        if curr_match:
+            c = curr_match.group(1)
+            return c, c, "verified", f"Inferred from context mentions of {c}"
+        if "€" in text_context:
+            return "EUR", "€", "verified", "Euro (€) symbol detected in document"
+        if "£" in text_context:
+            return "GBP", "£", "verified", "Pound (£) symbol detected in document"
+        if "₹" in text_context:
+            return "INR", "₹", "verified", "Rupee (₹) symbol detected in document"
+        if "$" in text_context:
+            return "USD", "$", "uncertain", "Dollar ($) symbol detected; assumed USD with uncertainty"
+
+    return None, None, "missing", None
+
+
+def parse_and_validate_amount(raw_text: str | None) -> tuple[float | None, str | None, str, str | None]:
+    """Parse and validate monetary total amount.
+    Returns (normalized_amount, raw_text, validation_status, note).
+    """
+    if not raw_text:
+        return None, None, "missing", None
+
+    cleaned = raw_text.strip()
+    if not cleaned or cleaned.lower() in PLACEHOLDER_STRINGS:
+        return None, None, "missing", None
+
+    # Strip currency symbols and extraneous letters
+    num_str = re.sub(r"[^\d.,\-]", "", cleaned)
+    num_clean = num_str.replace(",", "")
+    try:
+        val = float(num_clean)
+        if val < 0:
+            return None, cleaned, "invalid", "Monetary amount cannot be negative"
+        return round(val, 2), cleaned, "verified", None
+    except ValueError:
+        return None, cleaned, "invalid", f"Unparseable monetary amount '{cleaned}'"
+
+
+def parse_and_validate_hs_code(raw_text: str | None) -> tuple[str | None, str | None, str, str | None]:
+    """Parse and validate Harmonized System (HS) tariff code.
+    Returns (normalized_hs, raw_text, validation_status, note).
+    """
+    if not raw_text:
+        return None, None, "missing", None
+
+    cleaned = raw_text.strip()
+    if not cleaned or cleaned.lower() in PLACEHOLDER_STRINGS:
+        return None, None, "missing", None
+
+    digits = re.sub(r"[^\d]", "", cleaned)
+    if len(digits) < 4 or len(digits) > 10:
+        return None, cleaned, "invalid", f"HS code requires 4 to 10 digits; found {len(digits)} in '{cleaned}'"
+
+    norm = re.sub(r"[^\d.]", "", cleaned)
+    return norm, cleaned, "verified", f"Valid HS code format ({len(digits)} digits)"
+
+
+def parse_and_validate_packages(raw_text: str | None) -> tuple[int | None, str | None, str, str | None]:
+    """Parse package count integer.
+    Returns (package_count, raw_text, validation_status, note).
+    """
+    if not raw_text:
+        return None, None, "missing", None
+
+    cleaned = raw_text.strip()
+    if not cleaned or cleaned.lower() in PLACEHOLDER_STRINGS:
+        return None, None, "missing", None
+
+    m = re.search(r"([0-9,]+)", cleaned)
+    if not m:
+        return None, cleaned, "invalid", f"No numeric count found in packages '{cleaned}'"
+
+    try:
+        num = int(m.group(1).replace(",", ""))
+        if num < 0:
+            return None, cleaned, "invalid", "Package count cannot be negative"
+        return num, cleaned, "verified", None
+    except ValueError:
+        return None, cleaned, "invalid", f"Invalid integer package count in '{cleaned}'"
 
 
 def _clean_number(value: str | None) -> float | None:
-    if not value:
-        return None
-    cleaned = value.replace(",", "").strip()
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+    norm, _, _, _ = parse_and_validate_amount(value)
+    return norm
 
 
-def rules_extract(filename: str, text: str, doc_id: str = "") -> ExtractedDocument:
-    """Robust deterministic regex fallback with evidence snippet extraction."""
+def ground_text_snippet(
+    target_val: str | None,
+    text: str,
+    pages_meta: list[dict] | None = None,
+) -> tuple[str | None, int | None, int | None, int | None, bool, list[str]]:
+    """Ground a target text value in document text, finding line snippet, char offsets, and page number."""
+    if not target_val or not str(target_val).strip():
+        return None, None, None, None, False, ["Value is empty or missing."]
+
+    clean_target = str(target_val).strip()
+    idx = text.find(clean_target)
+    if idx == -1:
+        lower_idx = text.lower().find(clean_target.lower())
+        if lower_idx != -1:
+            idx = lower_idx
+            clean_target = text[lower_idx : lower_idx + len(clean_target)]
+        else:
+            escaped = re.escape(clean_target)
+            escaped = re.sub(r"\\\s+", r"\\s+", escaped)
+            m = re.search(escaped, text, re.IGNORECASE)
+            if m:
+                idx = m.start()
+                clean_target = text[m.start() : m.end()]
+
+    if idx == -1:
+        return None, None, None, None, False, ["Value not grounded in source: text not found in document."]
+
+    char_start = idx
+    char_end = idx + len(clean_target)
+    start_line = text.rfind("\n", 0, char_start)
+    end_line = text.find("\n", char_end)
+    line = text[start_line + 1 : end_line if end_line != -1 else len(text)].strip()
+
+    page_number = None
+    if pages_meta:
+        for p in pages_meta:
+            if p.get("char_start", 0) <= char_start <= p.get("char_end", 0):
+                page_number = p.get("page_number")
+                break
+
+    return line, char_start, char_end, page_number, True, []
+
+
+def rules_extract(
+    filename: str,
+    text: str,
+    doc_id: str = "",
+    pages_meta: list[dict] | None = None,
+    file_hash: str | None = None,
+) -> ExtractedDocument:
+    """Robust deterministic regex extraction with rich provenance and evidence grounding."""
     lower_name = filename.lower()
     lower_text = text.lower()
     first_lines = "\n".join(lower_text.splitlines()[:5])
 
-    # Check filename and top header lines first to avoid misclassifying by body references
+    # Classify document type based on filename and header lines first
     if "packing" in lower_name or "packing list" in first_lines:
         doc_type = "packing_list"
     elif "invoice" in lower_name or "commercial invoice" in first_lines or "invoice" in first_lines:
@@ -161,166 +436,297 @@ def rules_extract(filename: str, text: str, doc_id: str = "") -> ExtractedDocume
         doc_type = "unknown"
 
     evidence: dict[str, str] = {}
+    evidence_meta: dict[str, dict[str, Any]] = {}
+    field_evidence: dict[str, FieldEvidence] = {}
+    notes: list[str] = [
+        "Deterministic rules-based extraction used. Verify every field against source document."
+    ]
 
     def capture_with_snippet(pattern: str, field_name: str) -> str | None:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             captured = match.group(1).strip()
-            # Capture whole line or matching portion as supporting evidence snippet
+            char_start = match.start(1) if match.lastindex and match.lastindex >= 1 else match.start()
+            char_end = match.end(1) if match.lastindex and match.lastindex >= 1 else match.end()
             start = text.rfind("\n", 0, match.start())
             end = text.find("\n", match.end())
             line = text[start + 1 : end if end != -1 else len(text)].strip()
             evidence[field_name] = line
+            page_num = None
+            if pages_meta:
+                for p in pages_meta:
+                    if p.get("char_start", 0) <= char_start <= p.get("char_end", 0):
+                        page_num = p.get("page_number")
+                        break
+            evidence_meta[field_name] = {
+                "char_start": char_start,
+                "char_end": char_end,
+                "page_number": page_num,
+                "snippet": line,
+            }
             return captured
         return None
 
-    invoice_number = capture_with_snippet(
-        r"(?:invoice\s*(?:no\.?|number|#))\s*[:\-]?\s*([A-Z0-9\-/]+)", "invoice_number"
+    def record_provenance(
+        field_name: str,
+        val: Any,
+        raw_val: str | None,
+        norm_val: Any,
+        status: str,
+        note: str | None = None,
+        unit: str | None = None,
+    ):
+        meta = evidence_meta.get(field_name, {})
+        snip = meta.get("snippet") or evidence.get(field_name)
+        char_start = meta.get("char_start")
+        char_end = meta.get("char_end")
+        page_number = meta.get("page_number")
+
+        is_grounded = bool(snip and (val is not None or status != "missing"))
+        limitations: list[str] = []
+        if status == "missing" or val is None:
+            limitations.append("Field missing from document text.")
+            is_grounded = False
+        elif not snip:
+            limitations.append("Exact source snippet could not be isolated.")
+            is_grounded = False
+
+        evidence_id = f"ev-{doc_id or 'doc'}-{field_name}"
+        conf = 1.0 if status == "verified" else (0.5 if status == "uncertain" else (0.0 if status == "invalid" else None))
+        field_evidence[field_name] = FieldEvidence(
+            evidence_id=evidence_id,
+            value=val,
+            raw_value=raw_val,
+            normalized_value=norm_val,
+            unit=unit,
+            source_snippet=snip,
+            source_document=filename,
+            document_id=doc_id or None,
+            field_name=field_name,
+            char_start=char_start,
+            char_end=char_end,
+            page_number=page_number,
+            method="deterministic_rules",
+            validation_status=status,
+            confidence=conf,
+            notes=note,
+            limitations=limitations,
+            is_grounded=is_grounded,
+        )
+
+    # 1. Invoice Number
+    raw_inv = capture_with_snippet(
+        r"(?:invoice\s*(?:no\.?|number|#)|inv\s*(?:no\.?|#))\s*[:\-]?\s*([A-Z0-9\-/]+)",
+        "invoice_number",
     )
-    po_number = capture_with_snippet(
+    clean_inv = clean_entity_value(raw_inv)
+    inv_status = "verified" if clean_inv else ("invalid" if raw_inv else "missing")
+    record_provenance("invoice_number", clean_inv, raw_inv, clean_inv, inv_status)
+
+    # 2. Purchase Order Number
+    raw_po = capture_with_snippet(
         r"(?:purchase\s*order\s*(?:no\.?|number|#)|PO\s*(?:no\.?|#))\s*[:\-]?\s*([A-Z0-9\-/]+)",
         "purchase_order_number",
     )
-    exporter = capture_with_snippet(
+    clean_po = clean_entity_value(raw_po)
+    po_status = "verified" if clean_po else ("invalid" if raw_po else "missing")
+    record_provenance("purchase_order_number", clean_po, raw_po, clean_po, po_status)
+
+    # 3. Exporter / Shipper
+    raw_exporter = capture_with_snippet(
         r"(?:exporter|seller|shipper)\s*[:\-]\s*(.+)", "exporter"
     )
-    buyer = capture_with_snippet(
+    clean_exporter = clean_entity_value(raw_exporter)
+    exp_status = "verified" if clean_exporter else ("invalid" if raw_exporter else "missing")
+    record_provenance("exporter", clean_exporter, raw_exporter, clean_exporter, exp_status)
+
+    # 4. Buyer & Consignee
+    raw_buyer = capture_with_snippet(
         r"(?:buyer|consignee|customer|sold\s*to)\s*[:\-]\s*(.+)", "buyer"
     )
-    invoice_date = capture_with_snippet(
-        r"(?:invoice\s*date|date)\s*[:\-]\s*([0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})",
+    clean_buyer = clean_entity_value(raw_buyer)
+
+    raw_consignee = capture_with_snippet(
+        r"(?:consignee|notify\s*party)\s*[:\-]\s*(.+)", "consignee"
+    )
+    clean_consignee = clean_entity_value(raw_consignee)
+
+    buyer_status = "verified" if clean_buyer else ("invalid" if raw_buyer else "missing")
+    record_provenance("buyer", clean_buyer, raw_buyer, clean_buyer, buyer_status)
+
+    # 5. Invoice Date
+    raw_date = capture_with_snippet(
+        r"(?:invoice\s*date|date)\s*[:\-]\s*([0-9A-Za-z \t,\-/.]{6,25})",
         "invoice_date",
     )
-    currency = capture_with_snippet(
-        r"(?:currency)\s*[:\-]\s*([A-Z]{3})", "currency"
-    )
-    if not currency:
-        # Check for currency symbols or USD/EUR in amount line
-        curr_match = re.search(r"\b(USD|EUR|GBP|INR|SGD|AED|JPY)\b", text)
-        if curr_match:
-            currency = curr_match.group(1)
-            evidence["currency"] = f"Detected currency reference: {currency}"
+    norm_date, raw_date_ret, date_status, date_note = parse_and_validate_date(raw_date)
+    record_provenance("invoice_date", norm_date, raw_date or raw_date_ret, norm_date, date_status, date_note)
+    if date_status == "invalid":
+        notes.append(f"Invoice date parsing issue: {date_note}")
 
-    amount_str = capture_with_snippet(
+    # 6. Currency
+    raw_curr = capture_with_snippet(
+        r"(?:currency)\s*[:\-]\s*([A-Z]{3}|[$€£₹¥])", "currency"
+    )
+    norm_curr, raw_curr_ret, curr_status, curr_note = parse_and_validate_currency(raw_curr, text)
+    record_provenance("currency", norm_curr, raw_curr or raw_curr_ret, norm_curr, curr_status, curr_note)
+
+    # 7. Total Amount
+    raw_amount_str = capture_with_snippet(
         r"(?:grand\s*total|total\s*amount|invoice\s*total|total\s*value)\s*[:\-]?\s*(?:[A-Z]{3}\s*|\$\s*|€\s*|£\s*)?([0-9,]+(?:\.\d{1,2})?)",
         "total_amount",
     )
-    total_amount = _clean_number(amount_str)
+    norm_amount, raw_amt_ret, amt_status, amt_note = parse_and_validate_amount(raw_amount_str)
+    record_provenance("total_amount", norm_amount, raw_amount_str or raw_amt_ret, norm_amount, amt_status, amt_note, unit=norm_curr)
 
-    net_weight_str = capture_with_snippet(
-        r"(?:total\s*)?net\s*weight\s*[:\-]?\s*([0-9,]+(?:\.\d+)?\s*(?:kg|kgs|lbs|lb|mt|metric\s*tons|g)?)",
+    # 8. Net & Gross Weights
+    raw_net_str = capture_with_snippet(
+        r"(?:total\s*)?net\s*weight\s*[:\-]?\s*([0-9,]+(?:\.\d+)?\s*(?:kg|kgs|lbs|lb|mt|metric\s*tons|g|grams|oz)?)",
         "total_net_weight_kg",
     )
-    gross_weight_str = capture_with_snippet(
-        r"(?:total\s*)?gross\s*weight\s*[:\-]?\s*([0-9,]+(?:\.\d+)?\s*(?:kg|kgs|lbs|lb|mt|metric\s*tons|g)?)",
+    norm_net_kg, raw_net, net_status, net_note = normalize_weight_with_provenance(raw_net_str)
+    record_provenance("total_net_weight_kg", norm_net_kg, raw_net_str or raw_net, norm_net_kg, net_status, net_note, unit="kg" if norm_net_kg is not None else None)
+    if net_note:
+        notes.append(net_note)
+
+    raw_gross_str = capture_with_snippet(
+        r"(?:total\s*)?gross\s*weight\s*[:\-]?\s*([0-9,]+(?:\.\d+)?\s*(?:kg|kgs|lbs|lb|mt|metric\s*tons|g|grams|oz)?)",
         "total_gross_weight_kg",
     )
+    norm_gross_kg, raw_gross, gross_status, gross_note = normalize_weight_with_provenance(raw_gross_str)
+    record_provenance("total_gross_weight_kg", norm_gross_kg, raw_gross_str or raw_gross, norm_gross_kg, gross_status, gross_note, unit="kg" if norm_gross_kg is not None else None)
+    if gross_note:
+        notes.append(gross_note)
 
-    norm_net_kg, raw_net = normalize_weight_to_kg(net_weight_str)
-    norm_gross_kg, raw_gross = normalize_weight_to_kg(gross_weight_str)
-
-    packages_str = capture_with_snippet(
-        r"(?:total\s*)?(?:packages|cartons|boxes|cases|pallets|crates)\s*[:\-]?\s*([0-9,]+)",
+    # 9. Packages & Package Type
+    raw_pkgs_str = capture_with_snippet(
+        r"(?:total\s*)?(?:packages|cartons|boxes|cases|pallets|crates|bags|drums|units)\s*[:\-]?\s*([0-9,]+)",
         "packages",
     )
-    packages = int(packages_str.replace(",", "")) if packages_str else None
+    norm_pkgs, raw_pkgs, pkgs_status, pkgs_note = parse_and_validate_packages(raw_pkgs_str)
+    record_provenance("packages", norm_pkgs, raw_pkgs_str or raw_pkgs, norm_pkgs, pkgs_status, pkgs_note, unit="packages")
 
-    # Package type
-    pkg_type_match = re.search(r"\b(cartons|boxes|pallets|drums|bags|crates|cases)\b", text, re.IGNORECASE)
+    pkg_type_match = re.search(
+        r"\b(cartons|boxes|pallets|drums|bags|crates|cases|bundles|containers|tins|rolls|sacks|tubs|units|pkgs)\b",
+        text,
+        re.IGNORECASE,
+    )
     package_type = pkg_type_match.group(1).lower() if pkg_type_match else None
 
-    # Product description
-    product_desc = capture_with_snippet(
-        r"(?:product(?:s)?|description\s*(?:of\s*goods)?|cargo|item)\s*[:\-]\s*(.+)",
+    # 10. Product Description
+    raw_product_desc = capture_with_snippet(
+        r"(?:product(?:s)?|description\s*(?:of\s*goods)?|commodity|cargo|item)\s*[:\-]\s*(.+)",
         "product_description",
     )
+    clean_product_desc = clean_entity_value(raw_product_desc)
+    record_provenance(
+        "product_description",
+        clean_product_desc,
+        raw_product_desc,
+        clean_product_desc,
+        "verified" if clean_product_desc else ("invalid" if raw_product_desc else "missing"),
+    )
 
-    # HS code (typically 4 to 8 digits, e.g. 0303.89 or 03038900)
-    hs_code = capture_with_snippet(
+    # 11. HS Code
+    raw_hs_str = capture_with_snippet(
         r"(?:hs\s*code|tariff\s*(?:code|no)|hts\s*code)\s*[:\-]?\s*([0-9]{4}(?:\.[0-9]{2}(?:\.[0-9]{2})?|[0-9]{2,6}))",
         "hs_code",
     )
+    norm_hs, raw_hs, hs_status, hs_note = parse_and_validate_hs_code(raw_hs_str)
+    record_provenance("hs_code", norm_hs, raw_hs_str or raw_hs, norm_hs, hs_status, hs_note)
+    if hs_status == "invalid":
+        notes.append(f"HS code validation: {hs_note}")
 
-    # Country of origin
-    country_of_origin = capture_with_snippet(
+    # 12. Country of Origin
+    raw_coo = capture_with_snippet(
         r"(?:country\s*of\s*origin|origin)\s*[:\-]\s*([A-Za-z\s]+)", "country_of_origin"
     )
+    clean_coo = clean_entity_value(raw_coo)
+    record_provenance("country_of_origin", clean_coo, raw_coo, clean_coo, "verified" if clean_coo else "missing")
 
-    # Ports
-    port_loading = capture_with_snippet(
+    # 13. Ports
+    raw_pol = capture_with_snippet(
         r"(?:port\s*of\s*loading|POL|loading\s*port)\s*[:\-]\s*(.+)", "port_of_loading"
     )
-    port_discharge = capture_with_snippet(
-        r"(?:port\s*of\s*(?:discharge|destination)|POD|destination\s*port)\s*[:\-]\s*(.+)",
+    clean_pol = clean_entity_value(raw_pol)
+    record_provenance("port_of_loading", clean_pol, raw_pol, clean_pol, "verified" if clean_pol else "missing")
+
+    raw_pod = capture_with_snippet(
+        r"(?:port\s*of\s*(?:discharge|destination)|POD|destination\s*port|final\s*destination)\s*[:\-]\s*(.+)",
         "port_of_discharge",
     )
+    clean_pod = clean_entity_value(raw_pod)
+    record_provenance("port_of_discharge", clean_pod, raw_pod, clean_pod, "verified" if clean_pod else "missing")
 
-    # Shipment reference
-    shipment_ref = capture_with_snippet(
+    # 14. Shipment Reference
+    raw_ship_ref = capture_with_snippet(
         r"(?:shipment\s*(?:no\.?|ref|reference)|booking\s*no\.?|B/L\s*no\.?)\s*[:\-]\s*([A-Z0-9\-/]+)",
         "shipment_reference",
     )
+    clean_ship_ref = clean_entity_value(raw_ship_ref)
+    record_provenance("shipment_reference", clean_ship_ref, raw_ship_ref, clean_ship_ref, "verified" if clean_ship_ref else "missing")
 
-    # Incoterms
-    incoterms = capture_with_snippet(
+    # 15. Incoterms
+    raw_inco = capture_with_snippet(
         r"(?:incoterms|delivery\s*terms|terms)\s*[:\-]?\s*(FOB|CIF|CFR|EXW|DDP|FCA|CIP|DAP|CPT|DAT|FAS)\b|\b(FOB|CIF|CFR|EXW|DDP|FCA|CIP|DAP)\b",
         "incoterms",
     )
+    clean_inco = clean_entity_value(raw_inco)
+    record_provenance("incoterms", clean_inco, raw_inco, clean_inco, "verified" if clean_inco else "missing")
 
-    # Line item parsing (basic text tabular check)
+    # Line item parsing
     items: list[LineItem] = []
-    if product_desc:
+    if clean_product_desc:
         items.append(
             LineItem(
-                description=product_desc,
-                hs_code=hs_code,
-                quantity=float(packages) if packages else None,
+                description=clean_product_desc,
+                hs_code=norm_hs,
+                quantity=float(norm_pkgs) if norm_pkgs else None,
                 unit=package_type or "units",
-                amount=total_amount,
+                amount=norm_amount,
                 net_weight_kg=norm_net_kg,
                 gross_weight_kg=norm_gross_kg,
             )
         )
 
-    # Build rich field evidence
-    field_evidence: dict[str, FieldEvidence] = {
-        field_k: FieldEvidence(source_snippet=snip, confidence=1.0)
-        for field_k, snip in evidence.items()
-    }
-
-    notes = [
-        "Deterministic rules-based extraction used. Verify every field against source document."
-    ]
-    if raw_net and "lbs" in raw_net:
-        notes.append(f"Net weight converted from {raw_net} to {norm_net_kg} kg.")
-    if raw_gross and "lbs" in raw_gross:
-        notes.append(f"Gross weight converted from {raw_gross} to {norm_gross_kg} kg.")
-
     return ExtractedDocument(
         id=doc_id or f"doc-{uuid.uuid4().hex[:8]}",
         filename=filename,
         document_type=doc_type,
-        exporter=exporter,
-        buyer=buyer,
-        invoice_number=invoice_number,
-        purchase_order_number=po_number,
-        invoice_date=invoice_date,
-        currency=currency,
-        total_amount=total_amount,
+        exporter=clean_exporter,
+        buyer=clean_buyer,
+        consignee=clean_consignee,
+        invoice_number=clean_inv,
+        purchase_order_number=clean_po,
+        invoice_date=norm_date,
+        currency=norm_curr,
+        total_amount=norm_amount,
         total_net_weight_kg=norm_net_kg,
         total_gross_weight_kg=norm_gross_kg,
+        raw_invoice_number=raw_inv,
+        raw_invoice_date=raw_date,
+        raw_currency=raw_curr,
+        raw_total_amount=raw_amount_str,
         raw_net_weight=raw_net,
         raw_gross_weight=raw_gross,
-        packages=packages,
+        packages=norm_pkgs,
+        raw_packages=raw_pkgs_str,
         package_type=package_type,
-        product_description=product_desc,
-        hs_code=hs_code,
-        incoterms=incoterms,
-        country_of_origin=country_of_origin,
-        port_of_loading=port_loading,
-        port_of_discharge=port_discharge,
-        port_of_destination=port_discharge,
-        shipment_reference=shipment_ref,
+        product_description=clean_product_desc,
+        raw_product_description=raw_product_desc,
+        hs_code=norm_hs,
+        raw_hs_code=raw_hs_str,
+        incoterms=clean_inco,
+        raw_incoterms=raw_inco,
+        country_of_origin=clean_coo,
+        raw_country_of_origin=raw_coo,
+        port_of_loading=clean_pol,
+        raw_port_of_loading=raw_pol,
+        port_of_discharge=clean_pod,
+        raw_port_of_discharge=raw_pod,
+        port_of_destination=clean_pod,
+        shipment_reference=clean_ship_ref,
+        raw_shipment_reference=raw_ship_ref,
         items=items,
         evidence=evidence,
         field_evidence=field_evidence,
@@ -339,7 +745,13 @@ async def list_ollama_models(base_url: str) -> list[str]:
 
 
 async def ollama_extract(
-    base_url: str, model: str, filename: str, text: str, doc_id: str = ""
+    base_url: str,
+    model: str,
+    filename: str,
+    text: str,
+    doc_id: str = "",
+    pages_meta: list[dict] | None = None,
+    file_hash: str | None = None,
 ) -> ExtractedDocument:
     prompt = (
         f"Extract export document fields from this file.\n"
@@ -363,20 +775,147 @@ async def ollama_extract(
         response.raise_for_status()
         content = response.json().get("message", {}).get("content", "")
 
+    raw_content = content.strip()
+    if raw_content.startswith("```"):
+        raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content, flags=re.IGNORECASE)
+        raw_content = re.sub(r"\s*```$", "", raw_content).strip()
+
     try:
-        data = json.loads(content)
+        data = json.loads(raw_content)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Ollama returned invalid JSON for {filename}.") from exc
+
+    # Sanitize and validate AI output against schemas
+    sanitized: dict[str, Any] = {}
+    valid_doc_types = {"commercial_invoice", "packing_list", "purchase_order", "shipping_instructions", "unknown"}
+    raw_doc_type = str(data.get("document_type", "unknown")).lower()
+    if raw_doc_type in valid_doc_types:
+        sanitized["document_type"] = raw_doc_type
+    elif "invoice" in raw_doc_type:
+        sanitized["document_type"] = "commercial_invoice"
+    elif "packing" in raw_doc_type:
+        sanitized["document_type"] = "packing_list"
+    else:
+        sanitized["document_type"] = "unknown"
+
+    # Entities
+    sanitized["exporter"] = clean_entity_value(data.get("exporter"))
+    sanitized["buyer"] = clean_entity_value(data.get("buyer"))
+    sanitized["consignee"] = clean_entity_value(data.get("consignee"))
+    sanitized["invoice_number"] = clean_entity_value(data.get("invoice_number"))
+    sanitized["purchase_order_number"] = clean_entity_value(data.get("purchase_order_number"))
+    sanitized["product_description"] = clean_entity_value(data.get("product_description"))
+    sanitized["package_type"] = clean_entity_value(data.get("package_type"))
+    sanitized["country_of_origin"] = clean_entity_value(data.get("country_of_origin"))
+    sanitized["port_of_loading"] = clean_entity_value(data.get("port_of_loading"))
+    sanitized["port_of_discharge"] = clean_entity_value(data.get("port_of_discharge"))
+    sanitized["port_of_destination"] = clean_entity_value(data.get("port_of_destination")) or sanitized["port_of_discharge"]
+    sanitized["shipment_reference"] = clean_entity_value(data.get("shipment_reference"))
+    sanitized["incoterms"] = clean_entity_value(data.get("incoterms"))
+
+    # Invoice date validation
+    raw_ai_date = data.get("invoice_date")
+    norm_date, _, date_status, date_note = parse_and_validate_date(str(raw_ai_date) if raw_ai_date else None)
+    sanitized["invoice_date"] = norm_date
+    sanitized["raw_invoice_date"] = str(raw_ai_date) if raw_ai_date else None
+
+    # Currency validation
+    raw_ai_curr = data.get("currency")
+    norm_curr, _, curr_status, curr_note = parse_and_validate_currency(str(raw_ai_curr) if raw_ai_curr else None, text)
+    sanitized["currency"] = norm_curr
+    sanitized["raw_currency"] = str(raw_ai_curr) if raw_ai_curr else None
+
+    # Amount validation
+    raw_ai_amt = data.get("total_amount")
+    norm_amt, _, amt_status, amt_note = parse_and_validate_amount(str(raw_ai_amt) if raw_ai_amt is not None else None)
+    sanitized["total_amount"] = norm_amt
+    sanitized["raw_total_amount"] = str(raw_ai_amt) if raw_ai_amt is not None else None
+
+    # Weights normalization
+    raw_ai_net = data.get("raw_net_weight") or str(data.get("total_net_weight_kg", ""))
+    norm_net, raw_net_str, net_status, net_note = normalize_weight_with_provenance(raw_ai_net)
+    sanitized["total_net_weight_kg"] = norm_net
+    sanitized["raw_net_weight"] = raw_net_str
+
+    raw_ai_gross = data.get("raw_gross_weight") or str(data.get("total_gross_weight_kg", ""))
+    norm_gross, raw_gross_str, gross_status, gross_note = normalize_weight_with_provenance(raw_ai_gross)
+    sanitized["total_gross_weight_kg"] = norm_gross
+    sanitized["raw_gross_weight"] = raw_gross_str
+
+    # Packages validation
+    raw_ai_pkgs = data.get("packages")
+    norm_pkgs, _, pkgs_status, pkgs_note = parse_and_validate_packages(str(raw_ai_pkgs) if raw_ai_pkgs is not None else None)
+    sanitized["packages"] = norm_pkgs
+    sanitized["raw_packages"] = str(raw_ai_pkgs) if raw_ai_pkgs is not None else None
+
+    # HS code validation
+    raw_ai_hs = data.get("hs_code")
+    norm_hs, _, hs_status, hs_note = parse_and_validate_hs_code(str(raw_ai_hs) if raw_ai_hs else None)
+    sanitized["hs_code"] = norm_hs
+    sanitized["raw_hs_code"] = str(raw_ai_hs) if raw_ai_hs else None
+
+    # Grounded evidence extraction and provenance
+    ai_evidence = data.get("evidence", {}) if isinstance(data.get("evidence"), dict) else {}
+    sanitized_field_evidence: dict[str, FieldEvidence] = {}
+    for k, v in sanitized.items():
+        if k.startswith("raw_") or k in ("evidence", "field_evidence", "extraction_notes", "items", "id", "filename", "file_hash"):
+            continue
+        raw_v = sanitized.get(f"raw_{k}") or (str(v) if v is not None else None)
+        candidate_snip = ai_evidence.get(k)
+
+        target_to_search = candidate_snip if (candidate_snip and candidate_snip in text) else raw_v
+        line_snip, char_start, char_end, page_num, is_grounded, limitations = ground_text_snippet(
+            target_to_search,
+            text,
+            pages_meta,
+        )
+
+        status = "verified" if (v is not None and is_grounded) else ("missing" if v is None else "uncertain")
+        if not is_grounded and v is not None:
+            limitations.append("Value not grounded in source: LLM returned value not found in text.")
+
+        evidence_id = f"ev-{doc_id or 'doc'}-{k}"
+        sanitized_field_evidence[k] = FieldEvidence(
+            evidence_id=evidence_id,
+            value=v,
+            raw_value=raw_v,
+            normalized_value=v,
+            unit="kg" if "weight" in k else (sanitized.get("currency") if k == "total_amount" else None),
+            source_snippet=line_snip,
+            source_document=filename,
+            document_id=doc_id or None,
+            field_name=k,
+            char_start=char_start,
+            char_end=char_end,
+            page_number=page_num,
+            method="ollama_model",
+            validation_status=status,
+            confidence=0.9 if is_grounded else 0.0,
+            notes=f"Extracted by model '{model}'",
+            limitations=limitations,
+            is_grounded=is_grounded,
+        )
+
+    sanitized["evidence"] = ai_evidence
+    sanitized["field_evidence"] = sanitized_field_evidence
+
+    notes = data.get("extraction_notes", [])
+    if isinstance(notes, list):
+        sanitized["extraction_notes"] = [str(n) for n in notes]
+    else:
+        sanitized["extraction_notes"] = []
+    sanitized["extraction_notes"].append(f"AI model '{model}' inference completed.")
 
     return ExtractedDocument(
         id=doc_id or f"doc-{uuid.uuid4().hex[:8]}",
         filename=filename,
-        **data,
+        file_hash=file_hash,
+        **sanitized,
     )
 
 
 def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
-    """Perform deterministic cross-document reconciliation and generate discrepancies with recommendations."""
+    """Perform deterministic cross-document reconciliation and generate explainable, confidence-aware discrepancies."""
     discrepancies: list[Discrepancy] = []
 
     if len(documents) < 2:
@@ -386,6 +925,8 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
                 label="Document Count",
                 severity="info",
                 doc_values={d.filename: d.document_type for d in documents},
+                comparison_rule="multi_document_requirement",
+                source_documents=[d.filename for d in documents],
                 reason="Cross-document comparison requires at least two related documents.",
                 recommended_action="Upload both Commercial Invoice and Packing List for automated reconciliation.",
                 message="Single document uploaded. Upload a second document (e.g. Packing List) to compare cross-document values.",
@@ -393,122 +934,561 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         )
         return discrepancies
 
-    # Helper to check numeric discrepancy with calculable difference
-    def check_numeric_field(
+    # -------------------------------------------------------------------------
+    # 1. Weights: Net Weight & Gross Weight (Compatible Unit & Ambiguity Checks)
+    # -------------------------------------------------------------------------
+    def check_weight_field(
         field_name: str,
+        raw_field_name: str,
         label: str,
-        unit: str,
         severity_threshold: float,
         recommendation: str,
     ) -> None:
-        values: list[tuple[str, float]] = []
+        docs_with_weight: list[tuple[ExtractedDocument, float | None, str | None, str, str | None]] = []
         for doc in documents:
             val = getattr(doc, field_name)
-            if val is not None:
-                values.append((doc.filename, float(val)))
+            raw_val = getattr(doc, raw_field_name, None)
+            ev = doc.field_evidence.get(field_name)
+            status = ev.validation_status if ev else ("verified" if val is not None else "missing")
+            note = ev.notes if ev else None
+            if val is not None or (raw_val and raw_val.strip()):
+                docs_with_weight.append((doc, val, raw_val, status, note))
 
-        if len(values) < 2:
+        if len(docs_with_weight) < 2:
             return
 
-        first_val = values[0][1]
-        has_diff = any(abs(v[1] - first_val) > 0.001 for v in values)
-
-        if has_diff:
-            min_val = min(v[1] for v in values)
-            max_val = max(v[1] for v in values)
-            delta = max_val - min_val
-            pct = (delta / min_val * 100.0) if min_val > 0 else 0.0
-
-            # Strict 0.01% rounding tolerance check
-            if pct <= 0.01 and delta < 0.05:
-                return
-
-            doc_map = {name: f"{val:g} {unit}" for name, val in values}
-            detail_str = "; ".join(f"{name}: {val:g} {unit}" for name, val in values)
-
-            diff_str = f"Delta: +{delta:g} {unit} (+{pct:.2f}%)"
-            severity = "critical" if pct >= severity_threshold else "warning"
-
+        # Case 1A: Invalid weight measurement format
+        invalid_docs = [d for d in docs_with_weight if d[3] == "invalid" or (d[1] is None and d[2])]
+        if invalid_docs:
+            detail_str = "; ".join(f"{d[0].filename}: '{d[2]}'" for d in invalid_docs)
             discrepancies.append(
                 Discrepancy(
                     field=field_name,
                     label=label,
-                    severity=severity,
-                    doc_values=doc_map,
-                    difference=diff_str,
-                    reason=f"{label} values do not match across documents ({detail_str}).",
-                    source_document=", ".join(d.filename for d in documents),
-                    recommended_action=recommendation,
-                    message=f"{label} mismatch ({diff_str}): {detail_str}.",
+                    severity="critical",
+                    comparison_rule="weight_measurement_validity",
+                    doc_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                    raw_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                    normalized_values={d[0].filename: d[1] for d in docs_with_weight if d[1] is not None},
+                    provenance_statuses={d[0].filename: d[3] for d in docs_with_weight},
+                    source_documents=[d[0].filename for d in docs_with_weight],
+                    difference="Invalid weight measurement format",
+                    reason=f"Invalid weight measurement detected ({detail_str}). Cannot reconcile cargo without valid numeric weights.",
+                    recommended_action="Verify and correct the weight formatting in the source documents.",
+                    human_review_required=True,
+                    message=f"{label} format invalid: {detail_str}.",
                 )
             )
+            return
 
-    # Check Net Weight
-    check_numeric_field(
+        # Case 1B: Unit ambiguity (uncertain provenance or omitted units)
+        uncertain_docs = [d for d in docs_with_weight if d[3] == "uncertain"]
+        verified_docs = [d for d in docs_with_weight if d[3] == "verified"]
+
+        if uncertain_docs and verified_docs:
+            u_names = ", ".join(f"{d[0].filename} (raw: '{d[2]}')" for d in uncertain_docs)
+            v_names = ", ".join(f"{d[0].filename} ({d[1]:g} kg)" for d in verified_docs)
+            discrepancies.append(
+                Discrepancy(
+                    field=field_name,
+                    label=label,
+                    severity="critical",
+                    comparison_rule="compatible_weight_conversion",
+                    doc_values={d[0].filename: f"{d[1]:g} kg" if d[1] is not None else str(d[2]) for d in docs_with_weight},
+                    raw_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                    normalized_values={d[0].filename: d[1] for d in docs_with_weight if d[1] is not None},
+                    units={d[0].filename: "kg" if d[3] == "verified" else None for d in docs_with_weight},
+                    provenance_statuses={d[0].filename: d[3] for d in docs_with_weight},
+                    source_documents=[d[0].filename for d in docs_with_weight],
+                    difference="Unit ambiguity: one or more values lack explicit unit of measurement",
+                    reason=f"{label} cannot be safely verified: {u_names} omitted the weight unit, while {v_names} specifies explicit units. Never infer missing units as kg without confirmation.",
+                    recommended_action="Perform physical cargo weighment and confirm whether unspecified measurements represent kg, lbs, or metric tonnes.",
+                    human_review_required=True,
+                    message=f"{label} unit ambiguity: {u_names} lacks explicit unit.",
+                )
+            )
+            return
+        elif uncertain_docs and not verified_docs:
+            detail_str = "; ".join(f"{d[0].filename}: '{d[2]}'" for d in uncertain_docs)
+            discrepancies.append(
+                Discrepancy(
+                    field=field_name,
+                    label=label,
+                    severity="warning",
+                    comparison_rule="compatible_weight_conversion",
+                    doc_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                    raw_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                    normalized_values={d[0].filename: d[1] for d in docs_with_weight if d[1] is not None},
+                    provenance_statuses={d[0].filename: d[3] for d in docs_with_weight},
+                    source_documents=[d[0].filename for d in docs_with_weight],
+                    difference="Both measurements lack explicit units of measurement",
+                    reason=f"{label} values cannot be confirmed as matching because units of measurement are omitted across documents ({detail_str}).",
+                    recommended_action="Ensure cargo weighment units are explicitly declared on commercial invoice and packing list.",
+                    human_review_required=True,
+                    message=f"{label} units omitted on all documents ({detail_str}).",
+                )
+            )
+            return
+
+        # Case 1C: Both/All documents have verified, explicit compatible units (normalized to kg)
+        numeric_values = [(d[0].filename, float(d[1])) for d in docs_with_weight if d[1] is not None]
+        if len(numeric_values) < 2:
+            return
+
+        min_val = min(v[1] for v in numeric_values)
+        max_val = max(v[1] for v in numeric_values)
+        delta = max_val - min_val
+
+        # Exact match
+        if delta < 0.0001:
+            return
+
+        # Zero-denominator protected percentage calculation
+        pct = (delta / min_val * 100.0) if min_val > 0 else None
+
+        # Field-specific explicit conversion tolerance check (e.g. 1000 kg vs 2204.62 lbs conversion variance < 0.05 kg and <= 0.01%)
+        if delta < 0.05 and (pct is not None and pct <= 0.01):
+            return
+
+        # Genuine mismatch
+        doc_map = {name: f"{val:g} kg" for name, val in numeric_values}
+        detail_str = "; ".join(f"{name}: {val:g} kg" for name, val in numeric_values)
+        diff_str = f"Delta: +{delta:g} kg (+{pct:.2f}%)" if pct is not None else f"Delta: +{delta:g} kg (N/A %)"
+        severity = "critical" if (pct is None or pct >= severity_threshold) else "warning"
+
+        discrepancies.append(
+            Discrepancy(
+                field=field_name,
+                label=label,
+                severity=severity,
+                comparison_rule="compatible_weight_conversion",
+                doc_values=doc_map,
+                raw_values={d[0].filename: str(d[2]) for d in docs_with_weight},
+                normalized_values={d[0].filename: d[1] for d in docs_with_weight if d[1] is not None},
+                units={d[0].filename: "kg" for d in docs_with_weight},
+                provenance_statuses={d[0].filename: d[3] for d in docs_with_weight},
+                source_documents=[d[0].filename for d in docs_with_weight],
+                difference=diff_str,
+                delta_numeric=round(delta, 3),
+                delta_percentage=round(pct, 2) if pct is not None else None,
+                reason=f"{label} values do not match across documents ({detail_str}).",
+                recommended_action=recommendation,
+                human_review_required=True,
+                message=f"{label} mismatch ({diff_str}): {detail_str}.",
+            )
+        )
+
+    check_weight_field(
         field_name="total_net_weight_kg",
+        raw_field_name="raw_net_weight",
         label="Net Weight",
-        unit="kg",
         severity_threshold=0.5,
         recommendation="Reconcile cargo weights between Invoice and Packing List. Weight discrepancies trigger customs cargo inspection and delays at discharge port.",
     )
 
-    # Check Gross Weight
-    check_numeric_field(
+    check_weight_field(
         field_name="total_gross_weight_kg",
+        raw_field_name="raw_gross_weight",
         label="Gross Weight",
-        unit="kg",
         severity_threshold=1.0,
         recommendation="Verify gross weights including pallet/tare allowance. Accurate gross weight is legally mandatory for Verified Gross Mass (VGM) declarations under SOLAS.",
     )
 
-    # Check Total Amount
-    check_numeric_field(
-        field_name="total_amount",
-        label="Total Amount",
-        unit="",
-        severity_threshold=0.01,
-        recommendation="Ensure the invoice total matches purchase order and financial declarations. Valuation discrepancies lead to customs tariff re-assessment or penalties.",
-    )
+    # -------------------------------------------------------------------------
+    # 2. Financials: Currency & Total Amount (Cross-Currency & Decimal Precision)
+    # -------------------------------------------------------------------------
+    def check_financials() -> None:
+        curr_entries = []
+        for doc in documents:
+            if doc.currency and doc.currency.strip():
+                curr_entries.append((doc.filename, doc.currency.strip().upper()))
 
-    # Check Package Count
-    check_numeric_field(
-        field_name="packages",
-        label="Package Count",
-        unit="packages",
-        severity_threshold=0.01,
-        recommendation="Reconcile package/carton count between Commercial Invoice and Packing List. Package count mismatches routinely cause Bill of Lading hold.",
-    )
+        has_currency_conflict = False
+        if len(curr_entries) >= 2:
+            distinct_currs = {c[1] for c in curr_entries}
+            if len(distinct_currs) > 1:
+                has_currency_conflict = True
+                doc_map = {name: curr for name, curr in curr_entries}
+                detail_str = "; ".join(f"{name}: {curr}" for name, curr in curr_entries)
+                discrepancies.append(
+                    Discrepancy(
+                        field="currency",
+                        label="Currency",
+                        severity="critical",
+                        comparison_rule="currency_congruence",
+                        doc_values=doc_map,
+                        raw_values=doc_map,
+                        normalized_values=doc_map,
+                        provenance_statuses={d.filename: "verified" for d in documents if d.currency},
+                        source_documents=[c[0] for c in curr_entries],
+                        difference=f"{len(distinct_currs)} distinct currencies",
+                        reason=f"Transaction currency differs across commercial documents ({detail_str}).",
+                        recommended_action="Invoice currency must strictly match banking documentation and customs declaration.",
+                        human_review_required=True,
+                        message=f"Currency mismatch across documents: {detail_str}.",
+                    )
+                )
 
-    # Helper for text fields
+        amount_entries = []
+        for doc in documents:
+            if doc.total_amount is not None:
+                curr = doc.currency.strip().upper() if doc.currency else None
+                raw_amt = getattr(doc, "raw_total_amount", None) or f"{doc.total_amount}"
+                amount_entries.append((doc.filename, doc.total_amount, curr, raw_amt))
+
+        if len(amount_entries) < 2:
+            return
+
+        currencies_with_amounts = {e[2] for e in amount_entries if e[2]}
+        if len(currencies_with_amounts) > 1 or has_currency_conflict:
+            detail_str = "; ".join(f"{e[0]}: {e[2] or 'No Currency'} {e[1]:g}" for e in amount_entries)
+            discrepancies.append(
+                Discrepancy(
+                    field="total_amount",
+                    label="Total Amount",
+                    severity="critical",
+                    comparison_rule="monetary_total_comparison",
+                    doc_values={e[0]: f"{e[2] or ''} {e[1]:g}".strip() for e in amount_entries},
+                    raw_values={e[0]: e[3] for e in amount_entries},
+                    normalized_values={e[0]: e[1] for e in amount_entries},
+                    units={e[0]: e[2] for e in amount_entries},
+                    source_documents=[e[0] for e in amount_entries],
+                    difference="Not directly comparable: cross-currency valuation without documented exchange rate",
+                    reason=f"Total amounts cannot be safely compared across differing currencies ({detail_str}) without a verified conversion rate and rate date.",
+                    recommended_action="Provide a documented currency conversion rate and conversion date, or harmonize invoice amounts.",
+                    human_review_required=True,
+                    message=f"Total Amount cannot be compared directly across different currencies: {detail_str}.",
+                )
+            )
+            return
+
+        try:
+            decimal_vals = [(e[0], Decimal(str(e[1])), e[2], e[3]) for e in amount_entries]
+        except (InvalidOperation, TypeError):
+            decimal_vals = [(e[0], Decimal(round(e[1], 4)), e[2], e[3]) for e in amount_entries]
+
+        min_d = min(v[1] for v in decimal_vals)
+        max_d = max(v[1] for v in decimal_vals)
+        delta_d = max_d - min_d
+
+        if delta_d == Decimal(0):
+            return
+
+        pct_d = (delta_d / min_d * Decimal(100)) if min_d > Decimal(0) else None
+
+        if delta_d <= Decimal("0.05") and (pct_d is not None and pct_d <= Decimal("0.01")):
+            return
+
+        curr_label = amount_entries[0][2] or ""
+        doc_map = {e[0]: f"{curr_label} {e[1]:g}".strip() for e in amount_entries}
+        detail_str = "; ".join(f"{e[0]}: {curr_label} {e[1]:g}".strip() for e in amount_entries)
+        diff_str = f"Delta: +{delta_d:g} {curr_label} (+{pct_d:.2f}%)".strip() if pct_d is not None else f"Delta: +{delta_d:g} {curr_label} (N/A %)".strip()
+
+        severity = "critical" if (delta_d >= Decimal("1.0") or (pct_d is not None and pct_d >= Decimal("0.5"))) else "warning"
+
+        discrepancies.append(
+            Discrepancy(
+                field="total_amount",
+                label="Total Amount",
+                severity=severity,
+                comparison_rule="monetary_total_comparison",
+                doc_values=doc_map,
+                raw_values={e[0]: e[3] for e in amount_entries},
+                normalized_values={e[0]: float(e[1]) for e in decimal_vals},
+                units={e[0]: curr_label for e in amount_entries},
+                source_documents=[e[0] for e in amount_entries],
+                difference=diff_str,
+                delta_numeric=float(delta_d),
+                delta_percentage=float(round(pct_d, 2)) if pct_d is not None else None,
+                reason=f"Total amount values differ across documents ({detail_str}).",
+                recommended_action="Ensure the invoice total matches purchase order and financial declarations. Valuation discrepancies lead to customs tariff re-assessment or penalties.",
+                human_review_required=True,
+                message=f"Total Amount mismatch ({diff_str}): {detail_str}.",
+            )
+        )
+
+    check_financials()
+
+    # -------------------------------------------------------------------------
+    # 3. Package Count & Packaging Type
+    # -------------------------------------------------------------------------
+    def check_packages() -> None:
+        pkg_entries = []
+        for doc in documents:
+            if doc.packages is not None:
+                raw_pkg = getattr(doc, "raw_packages", None) or f"{doc.packages}"
+                pkg_entries.append((doc.filename, doc.packages, raw_pkg))
+
+        if len(pkg_entries) >= 2:
+            min_p = min(e[1] for e in pkg_entries)
+            max_p = max(e[1] for e in pkg_entries)
+            delta_p = max_p - min_p
+
+            if delta_p > 0:
+                pct_p = (delta_p / min_p * 100.0) if min_p > 0 else None
+                diff_str = f"Delta: +{delta_p} packages (+{pct_p:.2f}%)" if pct_p is not None else f"Delta: +{delta_p} packages (N/A %)"
+                detail_str = "; ".join(f"{e[0]}: {e[1]} packages" for e in pkg_entries)
+                severity = "critical" if delta_p >= 1 else "warning"
+
+                discrepancies.append(
+                    Discrepancy(
+                        field="packages",
+                        label="Package Count",
+                        severity=severity,
+                        comparison_rule="package_count_tally",
+                        doc_values={e[0]: f"{e[1]} packages" for e in pkg_entries},
+                        raw_values={e[0]: e[2] for e in pkg_entries},
+                        normalized_values={e[0]: e[1] for e in pkg_entries},
+                        units={e[0]: "packages" for e in pkg_entries},
+                        source_documents=[e[0] for e in pkg_entries],
+                        difference=diff_str,
+                        delta_numeric=float(delta_p),
+                        delta_percentage=round(pct_p, 2) if pct_p is not None else None,
+                        reason=f"Package count differs across documents ({detail_str}).",
+                        recommended_action="Reconcile package/carton count between Commercial Invoice and Packing List. Package count mismatches routinely cause Bill of Lading hold.",
+                        human_review_required=True,
+                        message=f"Package Count mismatch ({diff_str}): {detail_str}.",
+                    )
+                )
+
+        # Check package type
+        type_entries = []
+        for doc in documents:
+            if doc.package_type and doc.package_type.strip():
+                clean_t = re.sub(r"[\s\.,\-_]+", " ", doc.package_type.casefold()).strip()
+                type_entries.append((doc.filename, clean_t, doc.package_type.strip()))
+
+        if len(type_entries) >= 2:
+            distinct_types = {t[1] for t in type_entries}
+            if len(distinct_types) > 1:
+                detail_str = "; ".join(f"{t[0]}: '{t[2]}'" for t in type_entries)
+                discrepancies.append(
+                    Discrepancy(
+                        field="package_type",
+                        label="Package Type",
+                        severity="warning",
+                        comparison_rule="package_type_alignment",
+                        doc_values={t[0]: t[2] for t in type_entries},
+                        raw_values={t[0]: t[2] for t in type_entries},
+                        normalized_values={t[0]: t[2] for t in type_entries},
+                        source_documents=[t[0] for t in type_entries],
+                        difference=f"{len(distinct_types)} distinct package types",
+                        reason=f"Package types differ across documents ({detail_str}).",
+                        recommended_action="Ensure packaging specifications (cartons, drums, pallets) align across invoice and packing list.",
+                        human_review_required=True,
+                        message=f"Package Type mismatch: {detail_str}.",
+                    )
+                )
+
+    check_packages()
+
+    # -------------------------------------------------------------------------
+    # 4. Dates: Calendar Validity & Alignment
+    # -------------------------------------------------------------------------
+    def check_dates() -> None:
+        date_entries = []
+        for doc in documents:
+            raw_d = getattr(doc, "raw_invoice_date", None)
+            norm_d = doc.invoice_date
+            ev = doc.field_evidence.get("invoice_date")
+            st = ev.validation_status if ev else ("verified" if norm_d else "missing")
+            if norm_d or (raw_d and raw_d.strip()):
+                date_entries.append((doc.filename, norm_d, raw_d, st))
+
+        if not date_entries:
+            return
+
+        invalid_dates = [e for e in date_entries if e[3] == "invalid" or (e[1] is None and e[2])]
+        if invalid_dates:
+            detail_str = "; ".join(f"{e[0]}: '{e[2]}'" for e in invalid_dates)
+            discrepancies.append(
+                Discrepancy(
+                    field="invoice_date",
+                    label="Invoice Date",
+                    severity="critical",
+                    comparison_rule="calendar_date_validity",
+                    doc_values={e[0]: str(e[2]) for e in date_entries},
+                    raw_values={e[0]: str(e[2]) for e in date_entries},
+                    normalized_values={e[0]: e[1] for e in date_entries if e[1]},
+                    provenance_statuses={e[0]: e[3] for e in date_entries},
+                    source_documents=[e[0] for e in date_entries],
+                    difference="Invalid calendar date format",
+                    reason=f"Invalid date detected on paperwork ({detail_str}). Requires calendar correction.",
+                    recommended_action="Correct the invalid date format on the commercial document before customs lodgement.",
+                    human_review_required=True,
+                    message=f"Invoice Date format invalid: {detail_str}.",
+                )
+            )
+            return
+
+        valid_dates = [e for e in date_entries if e[1]]
+        if len(valid_dates) >= 2:
+            distinct_dates = {e[1] for e in valid_dates}
+            if len(distinct_dates) > 1:
+                detail_str = "; ".join(f"{e[0]}: {e[1]}" for e in valid_dates)
+                discrepancies.append(
+                    Discrepancy(
+                        field="invoice_date",
+                        label="Invoice Date",
+                        severity="warning",
+                        comparison_rule="date_congruence",
+                        doc_values={e[0]: e[1] for e in valid_dates},
+                        raw_values={e[0]: str(e[2]) for e in valid_dates},
+                        normalized_values={e[0]: e[1] for e in valid_dates},
+                        provenance_statuses={e[0]: e[3] for e in valid_dates},
+                        source_documents=[e[0] for e in valid_dates],
+                        difference=f"{len(distinct_dates)} distinct dates",
+                        reason=f"Invoice dates differ across paperwork ({detail_str}).",
+                        recommended_action="Verify chronological sequence between Commercial Invoice and Packing List.",
+                        human_review_required=True,
+                        message=f"Invoice Date mismatch: {detail_str}.",
+                    )
+                )
+
+    check_dates()
+
+    # -------------------------------------------------------------------------
+    # 5. HS Codes: Format Validity & Classification Alignment
+    # -------------------------------------------------------------------------
+    def check_hs_codes() -> None:
+        hs_entries = []
+        for doc in documents:
+            raw_hs = getattr(doc, "raw_hs_code", None)
+            norm_hs = doc.hs_code
+            ev = doc.field_evidence.get("hs_code")
+            st = ev.validation_status if ev else ("verified" if norm_hs else "missing")
+            if norm_hs or (raw_hs and raw_hs.strip()):
+                hs_entries.append((doc.filename, norm_hs, raw_hs, st))
+
+        if not hs_entries:
+            return
+
+        invalid_hs = [e for e in hs_entries if e[3] == "invalid" or (e[1] is None and e[2])]
+        if invalid_hs:
+            detail_str = "; ".join(f"{e[0]}: '{e[2]}'" for e in invalid_hs)
+            discrepancies.append(
+                Discrepancy(
+                    field="hs_code",
+                    label="HS Code",
+                    severity="critical",
+                    comparison_rule="hs_code_validity",
+                    doc_values={e[0]: str(e[2]) for e in hs_entries},
+                    raw_values={e[0]: str(e[2]) for e in hs_entries},
+                    normalized_values={e[0]: e[1] for e in hs_entries if e[1]},
+                    provenance_statuses={e[0]: e[3] for e in hs_entries},
+                    source_documents=[e[0] for e in hs_entries],
+                    difference="Invalid HS tariff code format",
+                    reason=f"Invalid HS code detected on paperwork ({detail_str}). HS tariff classification must be at least 4 numeric digits.",
+                    recommended_action="Verify and correct the HS tariff code classification against the national tariff schedule.",
+                    human_review_required=True,
+                    message=f"HS Code invalid format: {detail_str}.",
+                )
+            )
+            return
+
+        valid_hs = [e for e in hs_entries if e[1]]
+        if len(valid_hs) >= 2:
+            clean_hs = [(e[0], re.sub(r"[\s\.]", "", e[1]), e[1], e[2]) for e in valid_hs]
+            distinct_hs = {c[1] for c in clean_hs}
+            if len(distinct_hs) > 1:
+                detail_str = "; ".join(f"{c[0]}: {c[2]}" for c in clean_hs)
+                discrepancies.append(
+                    Discrepancy(
+                        field="hs_code",
+                        label="HS Code",
+                        severity="warning",
+                        comparison_rule="hs_code_classification",
+                        doc_values={c[0]: c[2] for c in clean_hs},
+                        raw_values={c[0]: str(c[3]) for c in clean_hs},
+                        normalized_values={c[0]: c[2] for c in clean_hs},
+                        provenance_statuses={c[0]: "verified" for c in clean_hs},
+                        source_documents=[c[0] for c in clean_hs],
+                        difference=f"{len(distinct_hs)} distinct HS codes",
+                        reason=f"HS Code tariff classification differs between documents ({detail_str}). Tariff reclassification risks customs delays and duties recalculation.",
+                        recommended_action="Confirm the harmonized tariff code classification is identical across shipping and customs declarations.",
+                        human_review_required=True,
+                        message=f"HS Code mismatch across documents: {detail_str}.",
+                    )
+                )
+
+    check_hs_codes()
+
+    # -------------------------------------------------------------------------
+    # 6. Product Descriptions Alignment
+    # -------------------------------------------------------------------------
+    def check_product_descriptions() -> None:
+        desc_entries = []
+        for doc in documents:
+            if doc.product_description and doc.product_description.strip():
+                clean_desc = re.sub(r"[\s\.,\-_]+", " ", doc.product_description.casefold()).strip()
+                desc_entries.append((doc.filename, clean_desc, doc.product_description.strip()))
+
+        if len(desc_entries) >= 2:
+            distinct_descs = {e[1] for e in desc_entries}
+            if len(distinct_descs) > 1:
+                detail_str = "; ".join(f"{e[0]}: '{e[2]}'" for e in desc_entries)
+                discrepancies.append(
+                    Discrepancy(
+                        field="product_description",
+                        label="Product Description",
+                        severity="critical",
+                        comparison_rule="product_description_congruence",
+                        doc_values={e[0]: e[2] for e in desc_entries},
+                        raw_values={e[0]: e[2] for e in desc_entries},
+                        normalized_values={e[0]: e[2] for e in desc_entries},
+                        provenance_statuses={e[0]: "verified" for e in desc_entries},
+                        source_documents=[e[0] for e in desc_entries],
+                        difference=f"{len(distinct_descs)} distinct descriptions",
+                        reason=f"Product descriptions differ across documents ({detail_str}). Cargo description must align between commercial invoice and packing list.",
+                        recommended_action="Verify trade description of goods across commercial invoice, packing list, and shipping instructions.",
+                        human_review_required=True,
+                        message=f"Product Description mismatch: {detail_str}.",
+                    )
+                )
+
+    check_product_descriptions()
+
+    # -------------------------------------------------------------------------
+    # 7. Text Field Comparators: Parties, References, Incoterms, Ports, COO
+    # -------------------------------------------------------------------------
     def check_text_field(
         field_name: str,
         label: str,
         severity: str,
+        comparison_rule: str,
         recommendation: str,
     ) -> None:
-        values: list[tuple[str, str]] = []
+        values: list[tuple[str, str, str]] = []
         for doc in documents:
             val = getattr(doc, field_name)
             if val and str(val).strip():
-                values.append((doc.filename, str(val).strip()))
+                raw_val = getattr(doc, f"raw_{field_name}", None) or str(val).strip()
+                values.append((doc.filename, str(val).strip(), raw_val))
 
         if len(values) < 2:
             return
 
         normalized = {re.sub(r"[\s\.,\-]", "", v[1].casefold()) for v in values}
         if len(normalized) > 1:
-            doc_map = {name: val for name, val in values}
-            detail_str = "; ".join(f"{name}: '{val}'" for name, val in values)
+            doc_map = {name: val for name, val, _ in values}
+            raw_map = {name: raw for name, _, raw in values}
+            detail_str = "; ".join(f"{name}: '{val}'" for name, val, _ in values)
             discrepancies.append(
                 Discrepancy(
                     field=field_name,
                     label=label,
                     severity=severity,  # type: ignore[arg-type]
+                    comparison_rule=comparison_rule,
                     doc_values=doc_map,
+                    raw_values=raw_map,
+                    normalized_values=doc_map,
+                    provenance_statuses={name: "verified" for name, _, _ in values},
+                    source_documents=[v[0] for v in values],
                     difference=f"{len(normalized)} distinct values",
                     reason=f"{label} differs between documents ({detail_str}).",
                     source_document=", ".join(d.filename for d in documents),
                     recommended_action=recommendation,
+                    human_review_required=True,
                     message=f"{label} inconsistent across documents: {detail_str}.",
                 )
             )
@@ -517,6 +1497,7 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         field_name="invoice_number",
         label="Invoice Number",
         severity="critical",
+        comparison_rule="strict_reference_match",
         recommendation="Commercial invoice reference must be strictly uniform across Packing List, Certificate of Origin, and Shipping Instructions.",
     )
 
@@ -524,6 +1505,7 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         field_name="buyer",
         label="Buyer / Consignee",
         severity="warning",
+        comparison_rule="buyer_consignee_alignment",
         recommendation="Verify buyer name and consignee address match the Purchase Order and Letter of Credit terms.",
     )
 
@@ -531,27 +1513,23 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         field_name="exporter",
         label="Exporter / Shipper",
         severity="warning",
+        comparison_rule="exporter_entity_alignment",
         recommendation="Confirm the exporter legal entity name matches trade registration and export license credentials.",
     )
 
     check_text_field(
-        field_name="currency",
-        label="Currency",
-        severity="critical",
-        recommendation="Invoice currency must match banking documentation and customs declaration.",
-    )
-
-    check_text_field(
-        field_name="hs_code",
-        label="HS Code",
+        field_name="country_of_origin",
+        label="Country of Origin",
         severity="warning",
-        recommendation="Confirm the harmonized tariff code classification is identical across shipping and customs declarations.",
+        comparison_rule="country_of_origin_alignment",
+        recommendation="Confirm declared country of origin aligns with preferential tariff rules and Certificate of Origin.",
     )
 
     check_text_field(
         field_name="port_of_loading",
         label="Port of Loading",
         severity="warning",
+        comparison_rule="port_of_loading_alignment",
         recommendation="Confirm origin port matches booking confirmation and export permit.",
     )
 
@@ -559,6 +1537,7 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         field_name="port_of_discharge",
         label="Port of Discharge",
         severity="warning",
+        comparison_rule="port_of_discharge_alignment",
         recommendation="Confirm destination port matches commercial contract and import permit.",
     )
 
@@ -566,16 +1545,20 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
         field_name="incoterms",
         label="Incoterms",
         severity="critical",
+        comparison_rule="incoterms_alignment",
         recommendation="Delivery terms (Incoterms) define risk transfer, freight liability, and insurance. Reconcile terms across commercial invoice and packing list.",
     )
 
-    # Missing crucial information checks - tagged as info to separate from conflicting discrepancies
+    # -------------------------------------------------------------------------
+    # 8. Missing Crucial Information Checks (Separated as 'info' Severity)
+    # -------------------------------------------------------------------------
     if not any(doc.invoice_number for doc in documents):
         discrepancies.append(
             Discrepancy(
                 field="missing_invoice_number",
                 label="Invoice Number Missing",
                 severity="info",
+                comparison_rule="mandatory_field_presence",
                 reason="No invoice number found in any uploaded document.",
                 recommended_action="Manually check documents or add invoice number reference before processing customs declaration.",
                 message="Invoice number reference not detected.",
@@ -588,6 +1571,7 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
                 field="missing_buyer",
                 label="Buyer / Consignee Missing",
                 severity="info",
+                comparison_rule="mandatory_field_presence",
                 reason="No buyer or consignee entity detected.",
                 recommended_action="Identify consignee details on commercial paperwork.",
                 message="Buyer/Consignee information not detected.",
@@ -600,6 +1584,7 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
                 field="missing_net_weight",
                 label="Net Weight Missing",
                 severity="info",
+                comparison_rule="mandatory_field_presence",
                 reason="Net weight is missing in source documents.",
                 recommended_action="Ensure net weight is recorded on packing list to satisfy port tally rules.",
                 message="Net weight not detected.",
@@ -612,11 +1597,40 @@ def compare_documents(documents: list[ExtractedDocument]) -> list[Discrepancy]:
                 field="reconciliation_clean",
                 label="Documents Reconciled",
                 severity="info",
+                comparison_rule="reconciliation_clean",
                 reason="All checked fields match across uploaded documents.",
                 recommended_action="Perform final operational review before lodging customs entry.",
                 message="No discrepancies detected among evaluated fields. Final human sign-off required.",
             )
         )
+
+    def populate_evidence_on_discrepancy(disc: Discrepancy) -> None:
+        target_field = disc.field
+        field_key_map = {
+            "missing_invoice_number": "invoice_number",
+            "missing_buyer": "buyer",
+            "missing_exporter": "exporter",
+            "missing_net_weight": "total_net_weight_kg",
+            "missing_hs_code": "hs_code",
+        }
+        lookup_field = field_key_map.get(target_field, target_field)
+
+        for doc in documents:
+            ev = doc.field_evidence.get(lookup_field)
+            if ev:
+                disc.evidence[doc.filename] = ev
+                disc.source_snippets[doc.filename] = ev.source_snippet
+                disc.evidence_ids[doc.filename] = ev.evidence_id
+            else:
+                disc.source_snippets[doc.filename] = None
+                disc.evidence_ids[doc.filename] = None
+
+    for idx, disc in enumerate(discrepancies):
+        if not disc.id:
+            clean_field = re.sub(r"[^a-zA-Z0-9_]", "_", disc.field)
+            disc.id = f"fnd-{clean_field}-{idx+1}"
+        if not disc.evidence:
+            populate_evidence_on_discrepancy(disc)
 
     return discrepancies
 
@@ -656,6 +1670,17 @@ def make_shipment_summary(
     missing_fields: list[str] = []
 
     for attr, label in fields_to_check:
+        # If there is any active conflict for this field, it cannot be confirmed
+        if any(d.field == attr for d in conflicts):
+            continue
+
+        # If any document has an uncertain or invalid validation status for this field, it cannot be confirmed
+        if any(
+            doc.field_evidence.get(attr) and doc.field_evidence[attr].validation_status in ("uncertain", "invalid")
+            for doc in documents
+        ):
+            continue
+
         vals = [getattr(doc, attr) for doc in documents if getattr(doc, attr) not in (None, "")]
         if not vals:
             missing_fields.append(label)
@@ -703,10 +1728,17 @@ def make_shipment_summary(
     has_net_wt = any(doc.total_net_weight_kg is not None for doc in documents)
     has_gross_wt = any(doc.total_gross_weight_kg is not None for doc in documents)
     has_pkgs = any(doc.packages is not None for doc in documents)
-    weight_conflicts = [d for d in conflicts if d.field in ("total_net_weight_kg", "total_gross_weight_kg", "packages")]
+    weight_conflicts = [d for d in conflicts if d.field in ("total_net_weight_kg", "total_gross_weight_kg", "packages", "package_type")]
+    has_uncertain_weight = any(
+        doc.field_evidence.get("total_net_weight_kg") and doc.field_evidence["total_net_weight_kg"].validation_status in ("uncertain", "invalid")
+        for doc in documents
+    )
     if weight_conflicts:
         chk_weights_status = "failed"
         chk_weights_detail = f"Cargo weight or package count mismatch: {'; '.join(d.message for d in weight_conflicts)}."
+    elif has_uncertain_weight:
+        chk_weights_status = "needs_review"
+        chk_weights_detail = "Cargo weight unit is uncertain or omitted. Physical cargo weighment required before export."
     elif not has_net_wt and not has_gross_wt and not has_pkgs:
         chk_weights_status = "needs_review"
         chk_weights_detail = "Weight and packaging details are missing. Sufficient cargo data required for tally."

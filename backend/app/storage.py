@@ -5,8 +5,16 @@ from pathlib import Path
 
 from .documents import sanitize_filename
 
-DEFAULT_STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "documents"
+FALLBACK_STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "documents"
+LIVE_STORAGE_DIR = FALLBACK_STORAGE_DIR.resolve()
+_env_storage = os.getenv("TRADESATHI_STORAGE_PATH")
+DEFAULT_STORAGE_DIR = Path(_env_storage).resolve() if _env_storage else FALLBACK_STORAGE_DIR
 _active_storage_dir: Path = DEFAULT_STORAGE_DIR
+
+
+def is_test_environment() -> bool:
+    """Return True if running under pytest or explicit test mode."""
+    return bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("TRADESATHI_TEST_MODE") == "1")
 
 
 def set_storage_dir(path: Path | str) -> None:
@@ -17,6 +25,11 @@ def set_storage_dir(path: Path | str) -> None:
 
 
 def get_storage_dir() -> Path:
+    if is_test_environment() and _active_storage_dir.resolve() == LIVE_STORAGE_DIR:
+        raise RuntimeError(
+            f"CRITICAL TEST ISOLATION FAILURE: Attempted access to LIVE document storage ({LIVE_STORAGE_DIR}) "
+            "during automated test execution. All tests must execute against isolated temporary storage."
+        )
     _active_storage_dir.mkdir(parents=True, exist_ok=True)
     return _active_storage_dir
 
